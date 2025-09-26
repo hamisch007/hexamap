@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interaktives Hexagonales Gitter auf Google Maps</title>
+    <style>
+        #map {
+            height: 100vh;
+            width: 100%;
+        }
+    </style>
+    <!-- Google Maps API laden (ersetzen Sie YOUR_GOOGLE_API_KEY durch Ihren echten Key) -->
+    <script async defer src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAZzqdJcs2uvduF5CYkcjONMYD6wSTOyok&callback=initMap&libraries=geometry"></script>
+    <!-- H3-JS Library via CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/h3-js@4.1.0/umd/h3-js.min.js"></script>
+</head>
+<body>
+    <div id="map"></div>
+
+    <script>
+        // Konfiguration (passen Sie diese Werte an Ihre Adalo-App an)
+        const ADALO_BASE_URL = 'https://api.adalo.com/v0/apps/YOUR_ADALO_APP_ID/collections/YOUR_COLLECTION_ID/records'; // Ersetzen Sie YOUR_ADALO_APP_ID und YOUR_COLLECTION_ID
+        const ADALO_API_KEY = 'YOUR_ADALO_API_KEY'; // Ihr Adalo API-Key
+        const H3_RESOLUTION = 8; // Ca. 1 km pro Hexagon (Durchschnitt: ~0.74 km² Fläche, ~0.93 km Kante)
+        const STAY_THRESHOLD_MS = 5 * 60 * 1000; // 5 Minuten
+
+        let map;
+        let hexagons = {}; // h3Index -> {polygon: google.maps.Polygon, status: number, color: string, recordId: string}
+        let currentHex = null;
+        let stayStartTime = null;
+        let watchId;
+
+        // Headers für Adalo API
+        const adaloHeaders = {
+            'Authorization': `Bearer ${ADALO_API_KEY}`,
+            'Content-Type': 'application/json'
+        };
+
+        // Funktion zum Aktualisieren eines Hexagons in der DB und visuell
+        function updateHexStatus(h3Index, status, color, recordId) {
+            const body = JSON.stringify({
+                properties: {
+                    status: status,
+                    color: color
+                }
+            });
+
+            fetch(`${ADALO_BASE_URL}/${recordId}`, {
+                method: 'PATCH',
+                headers: adaloHeaders,
+                body: body
+            })
+            .then(response => response.json())
+            .then(data => {
+                console.log(`Hexagon ${h3Index} aktualisiert: Status ${status}, Farbe ${color}`);
+                // Visuelle Aktualisierung
+                if (hexagons[h3Index]) {
+                    hexagons[h3Index].polygon.setOptions({
+                        fillOpacity: status === 1 ? 0 : 0.5,
+                        fillColor: color === 'black' ? '#000000' : '#000000' // FillColor irrelevant bei Opacity 0
+                    });
+                    hexagons[h3Index].status = status;
+                    hexagons[h3Index].color = color;
+                }
+            })
+            .catch(error => console.error('Fehler beim Aktualisieren der DB:', error));
+        }
+
+        // Funktion zum Laden/Erstellen von Hexagonen für den aktuellen Viewport
+        function loadHexagons() {
+            const bounds = map.getBounds();
+            if (!bounds) return;
+
+            // Bounding Box als GeoJSON Polygon
+            const sw = bounds.getSouthWest();
+            const ne = bounds.getNorthEast();
+            const geo = {
+                type: 'Polygon',
+                coordinates: [[
+                    [sw.lng(), sw.lat()],
+                    [ne.lng(), sw.lat()],
+                    [ne.lng(), ne.lat()],
+                    [sw.lng(), ne.lat()],
+                    [sw.lng(), sw.lat()]
+                ]]
+            };
+
+            // H3 Polyfill: Generiert H3-Indizes, die den Polygon abdecken
+            const cells = h3.polyfill(geo, H3_RESOLUTION);
+
+            cells.forEach(h3Index => {
+                if (hexagons[h3Index]) return; // Bereits geladen
+
+                // Prüfe, ob Hexagon in DB existiert (Filter nach h3Index)
+                fetch(`${ADALO_BASE_URL}?filterKey=h3Index&filterValue=${h3Index}`, {
+                    headers: adaloHeaders
+                })
+                .then(response => response.json())
+                .then(data => {
+                    let record = data.records && data.records[0] ? data.records[0] : null;
+                    const recordId = record ? record.id : null;
+                    let status = 0;
+                    let color = 'black';
+
+                    if (!record) {
+                        // Neues Record erstellen
+                        const newRecordBody = JSON.stringify({
+                            properties: {
+                                h3Index: h3Index,
+                                status: 0,
+                                color: 'black'
+                            }
+                        });
+                        return fetch(ADALO_BASE_URL, {
+                            method: 'POST',
+                            headers: adaloHeaders,
+                            body: newRecordBody
+                        })
+                        .then(resp => resp.json())
+                        .then(newData => {
+                            record = newData.record;
+                            recordId = record.id;
+                            return { recordId, status: 0, color: 'black' };
+                        });
+                    } else {
+                        status = record.properties.status || 0;
+                        color = record.properties.color || 'black';
+                        return { recordId, status, color };
+                    }
+                })
+                .then(({ recordId, status, color }) => {
+                    // Boundary des Hexagons abrufen (Array von [lng, lat])
+                    const boundary = h3.cellToBoundary(h3Index);
+                    const path = boundary.map(coord => ({ lat: coord[1], lng: coord[0] }));
+
+                    // Google Maps Polygon erstellen
+                    const polygon = new google.maps.Polygon({
+                        paths: path,
+                        strokeColor: '#000000',
+                        strokeOpacity: 0.8,
+                        strokeWeight: 1,
+                        fillColor: '#000000',
+                        fillOpacity: status === 1 ? 0 : 0.5, // Transparent bei Status 1
+                        map: map
+                    });
+
+                    hexagons[h3Index] = { polygon, status, color, recordId };
+                })
+                .catch(error => console.error('Fehler beim Laden des Hexagons:', error));
+            });
+        }
+
+        // Positionstracking starten
+        function startLocationTracking() {
+            if (!navigator.geolocation) {
+                console.error('Geolocation nicht unterstützt');
+                return;
+            }
+
+            watchId = navigator.geolocation.watchPosition(
+                position => {
+                    const lat = position.coords.latitude;
+                    const lng = position.coords.longitude;
+                    const point = new google.maps.LatLng(lat, lng);
+
+                    // Prüfe, in welchem Hexagon der Punkt liegt
+                    let inHex = null;
+                    for (const [h3Index, hexData] of Object.entries(hexagons)) {
+                        if (google.maps.geometry.poly.containsLocation(point, hexData.polygon)) {
+                            inHex = h3Index;
+                            break;
+                        }
+                    }
+
+                    if (inHex !== currentHex) {
+                        // Prüfe Aufenthalt in vorherigem Hexagon
+                        if (currentHex && stayStartTime) {
+                            const stayTime = Date.now() - stayStartTime;
+                            if (stayTime >= STAY_THRESHOLD_MS && hexagons[currentHex].status === 0) {
+                                updateHexStatus(currentHex, 1, 'transparent', hexagons[currentHex].recordId);
+                            }
+                        }
+
+                        // Neues Hexagon
+                        currentHex = inHex;
+                        stayStartTime = Date.now();
+                    }
+                },
+                error => {
+                    console.error('Geolocation Fehler:', error);
+                },
+                {
+                    enableHighAccuracy: true,
+                    timeout: 5000,
+                    maximumAge: 10000 // 10 Sekunden
+                }
+            );
+        }
+
+        // Map initialisieren
+        function initMap() {
+            map = new google.maps.Map(document.getElementById('map'), {
+                zoom: 12,
+                center: { lat: 52.5200, lng: 13.4050 } // Beispiel: Berlin
+            });
+
+            // Hexagone laden, sobald Bounds verfügbar
+            google.maps.event.addListenerOnce(map, 'bounds_changed', () => {
+                loadHexagons();
+                startLocationTracking();
+            });
+
+            // Bei Panning/Zooming neue Hexagone laden (vereinfacht: immer neu laden)
+            google.maps.event.addListener(map, 'idle', loadHexagons);
+        }
+
+        // Globale Funktion für Google Maps Callback
+        window.initMap = initMap;
+    </script>
+</body>
+</html>
